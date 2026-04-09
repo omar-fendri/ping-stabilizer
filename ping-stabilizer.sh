@@ -14,8 +14,9 @@ PF_ANCHOR="com.ping-stabilizer"
 PIPE_NR=1
 DEFAULT_HOST="8.8.8.8"
 DEFAULT_COUNT=10
-MONITOR_INTERVAL=0.5
-CHANGE_THRESHOLD=2  # ms — only update pipe if delay changes by more than this
+MONITOR_INTERVAL=0.2  # 200ms — faster sampling for better smoothing
+CHANGE_THRESHOLD=2    # ms — only update pipe if delay changes by more than this
+EWMA_ALPHA=30         # 0-100, weight of new sample (30 = 0.30). Lower = smoother, slower to adapt
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -342,6 +343,8 @@ print_comparison_row() {
 run_monitor() {
     local host="$1" target="$2"
     local current_delay=0
+    local smoothed_rtt=-1  # EWMA of true network RTT (scaled x100 for precision)
+    local sample_count=0
 
     # Set initial delay (passed as $3 if available)
     if [[ -n "${3:-}" ]]; then
@@ -355,12 +358,30 @@ run_monitor() {
         if [[ -n "$rtt" ]]; then
             # CRITICAL: The measured RTT includes our own added delay.
             # Subtract it to get the true network RTT.
-            # true_rtt = measured_rtt - current_delay
             local rtt_int=${rtt%.*}
             local true_rtt=$(( rtt_int - current_delay ))
             [[ $true_rtt -lt 0 ]] && true_rtt=0
 
-            local new_delay=$(( target - true_rtt ))
+            # Scale to x100 for integer EWMA math
+            local true_rtt_100=$(( true_rtt * 100 ))
+
+            if [[ $smoothed_rtt -lt 0 ]]; then
+                # First sample: initialize directly
+                smoothed_rtt=$true_rtt_100
+            else
+                # Outlier rejection: ignore if >2x the smoothed average
+                local outlier_limit=$(( smoothed_rtt * 2 ))
+                if [[ $true_rtt_100 -le $outlier_limit ]] || [[ $sample_count -lt 5 ]]; then
+                    # EWMA: smoothed = alpha * new + (1 - alpha) * old
+                    smoothed_rtt=$(( (EWMA_ALPHA * true_rtt_100 + (100 - EWMA_ALPHA) * smoothed_rtt) / 100 ))
+                fi
+                # else: outlier, skip this sample
+            fi
+            sample_count=$(( sample_count + 1 ))
+
+            # Calculate delay from smoothed RTT (unscale from x100)
+            local smoothed_rtt_ms=$(( smoothed_rtt / 100 ))
+            local new_delay=$(( target - smoothed_rtt_ms ))
             [[ $new_delay -lt 0 ]] && new_delay=0
 
             # Only update if change exceeds threshold
@@ -373,7 +394,7 @@ run_monitor() {
             fi
 
             # Write stats for status command
-            echo "$rtt $true_rtt $current_delay $(date +%s)" > "$STATE_DIR/stats" 2>/dev/null || true
+            echo "$rtt $true_rtt $smoothed_rtt_ms $current_delay $(date +%s)" > "$STATE_DIR/stats" 2>/dev/null || true
         fi
 
         sleep "$MONITOR_INTERVAL"
@@ -479,7 +500,7 @@ cmd_start() {
     info "Monitor running (PID $monitor_pid)"
 
     # ── Verify ──
-    sleep 2  # let monitor settle
+    sleep 4  # let EWMA stabilize (~20 samples at 200ms)
     run_ping_test "$host" "$count" "stabilized"
     local stabilized_stats="$REPLY_STATS"
 
@@ -582,10 +603,11 @@ cmd_status() {
     echo "  Monitor: PID $pid"
 
     if [[ -f "$STATE_DIR/stats" ]]; then
-        local measured_rtt true_rtt current_delay timestamp
-        read -r measured_rtt true_rtt current_delay timestamp < "$STATE_DIR/stats"
+        local measured_rtt true_rtt smoothed_rtt current_delay timestamp
+        read -r measured_rtt true_rtt smoothed_rtt current_delay timestamp < "$STATE_DIR/stats"
         echo "  Measured RTT:  ${measured_rtt}ms (includes added delay)"
-        echo "  True net RTT:  ${true_rtt}ms"
+        echo "  True net RTT:  ${true_rtt}ms (last sample)"
+        echo "  Smoothed RTT:  ${smoothed_rtt}ms (EWMA)"
         echo "  Current delay: ${current_delay}ms"
     fi
 
@@ -688,7 +710,7 @@ cmd_demo() {
     echo "$monitor_pid" > "$STATE_DIR/monitor.pid"
     disown "$monitor_pid" 2>/dev/null || true
 
-    sleep 2  # let monitor settle
+    sleep 4  # let EWMA stabilize (~20 samples at 200ms)
 
     run_ping_test "$google_host" "$count" "Google DNS"
     local google_stable="$REPLY_STATS"
@@ -751,6 +773,561 @@ cmd_demo() {
     echo "AWS jitter:        ${base_jitter}ms (baseline) -> ${stable_jitter}ms (stabilized)"
 }
 
+# ─── Detect Luna server ───────────────────────────────────────────────────────
+
+cmd_detect() {
+    require_root
+
+    local mode="${1:-watch}"
+
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║           LUNA SERVER DETECTION                            ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+
+    # Get local IP to exclude from results
+    local local_ip
+    local_ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo "")
+
+    if [[ "$mode" == "snap" ]]; then
+        # Snapshot mode: capture 5 seconds of live UDP traffic
+        detect_capture_traffic "$local_ip" 5
+        return 0
+    fi
+
+    # Watch mode: capture traffic diff before/after game launch
+    echo "This will detect Luna's game streaming server by capturing"
+    echo "network traffic before and after you start a game."
+    echo ""
+    echo "Instructions:"
+    echo "  1. Open Amazon Luna in your browser (don't start a game yet)"
+    echo "  2. Press ENTER here when ready..."
+    read -r
+
+    info "Capturing baseline traffic for 5 seconds..."
+    local before_ips
+    before_ips=$(capture_remote_udp_ips "$local_ip" 5)
+
+    echo ""
+    echo "  3. Now START a game in Luna"
+    echo "  4. Wait 5-10 seconds for the stream to begin"
+    echo "  5. Press ENTER here when the game is running..."
+    read -r
+
+    info "Capturing game traffic for 8 seconds..."
+    local after_ips
+    after_ips=$(capture_remote_udp_ips "$local_ip" 8)
+
+    # Find new IPs (in after but not in before), with packet counts
+    local new_ips
+    new_ips=$(comm -13 <(echo "$before_ips" | awk '{print $1}' | sort) \
+                       <(echo "$after_ips" | awk '{print $1}' | sort) || true)
+
+    if [[ -z "$new_ips" ]]; then
+        # Fall back: show top talkers from the game capture
+        info "No exclusively new IPs, showing top UDP destinations by packet count:"
+        echo ""
+        new_ips=$(echo "$after_ips" | awk '{print $1}')
+    fi
+
+    # Score and display candidates
+    detect_score_candidates "$new_ips" "$after_ips" "$local_ip"
+}
+
+# Run tcpdump for N seconds, write to file. macOS has no `timeout`, so use background + sleep + kill.
+run_tcpdump_for() {
+    local duration="$1" outfile="$2"
+    # Capture all UDP except DNS, on default interface
+    tcpdump -i en0 -n -l udp and not port 53 > "$outfile" 2>/dev/null &
+    local pid=$!
+    sleep "$duration"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+# Filter tcpdump output to external IPs with packet counts
+extract_external_ips() {
+    local local_ip="$1"
+    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+        grep -v "^${local_ip}$" | \
+        grep -v '^127\.' | \
+        grep -v '^10\.' | \
+        grep -v '^192\.168\.' | \
+        grep -v '^172\.1[6-9]\.' | \
+        grep -v '^172\.2[0-9]\.' | \
+        grep -v '^172\.3[0-1]\.' | \
+        grep -v '^224\.' | \
+        grep -v '^239\.' | \
+        grep -v '^255\.' | \
+        sort | uniq -c | sort -rn || true
+}
+
+# Capture UDP traffic for N seconds, return "ip packet_count" lines sorted by count
+capture_remote_udp_ips() {
+    local local_ip="$1" duration="$2"
+    local tmpfile="/tmp/ping-stabilizer-capture-$$.txt"
+
+    run_tcpdump_for "$duration" "$tmpfile"
+
+    if [[ -s "$tmpfile" ]]; then
+        cat "$tmpfile" | extract_external_ips "$local_ip" | awk '{print $2, $1}'
+    fi
+    rm -f "$tmpfile"
+}
+
+# Capture and display live UDP traffic for N seconds
+detect_capture_traffic() {
+    local local_ip="$1" duration="$2"
+
+    info "Capturing live UDP traffic for ${duration} seconds (excluding DNS)..."
+    echo ""
+
+    local capture_file="/tmp/ping-stabilizer-capture.txt"
+
+    run_tcpdump_for "$duration" "$capture_file"
+
+    if [[ ! -s "$capture_file" ]]; then
+        warn "No UDP traffic captured. Is Luna streaming?"
+        rm -f "$capture_file"
+        return 1
+    fi
+
+    # Extract remote IPs with packet counts (exclude private/local)
+    local ip_counts
+    ip_counts=$(cat "$capture_file" | extract_external_ips "$local_ip")
+
+    if [[ -z "$ip_counts" ]]; then
+        warn "No external UDP traffic found."
+        rm -f "$capture_file"
+        return 1
+    fi
+
+    info "External UDP destinations (by packet count):"
+    echo ""
+    printf "  %-18s %10s\n" "IP Address" "Packets"
+    printf "  %-18s %10s\n" "──────────────────" "────────"
+    echo "$ip_counts" | head -15 | awk '{printf "  %-18s %10s\n", $2, $1}'
+
+    # The top talker is likely the streaming server
+    local top_ip top_count
+    top_ip=$(echo "$ip_counts" | head -1 | awk '{print $2}')
+    top_count=$(echo "$ip_counts" | head -1 | awk '{print $1}')
+
+    rm -f "$capture_file"
+
+    if [[ -n "$top_ip" ]]; then
+        echo ""
+        info "Top talker: $top_ip ($top_count packets)"
+        local rtt
+        rtt=$(ping -c 5 -W 5000 "$top_ip" 2>/dev/null | tail -1 | sed 's/.*= [0-9.]*\/\([0-9.]*\)\/.*/\1/' || echo "timeout")
+        if [[ "$rtt" != "timeout" ]]; then
+            local rtt_int=${rtt%.*}
+            info "Ping to $top_ip: avg ${rtt}ms"
+            echo ""
+            echo "  Suggested commands:"
+            echo "    sudo $0 baseline -h $top_ip"
+            echo "    sudo $0 start -t $(( rtt_int + 20 )) -h $top_ip"
+        else
+            warn "$top_ip doesn't respond to ping (may block ICMP)"
+        fi
+    fi
+}
+
+# Score candidate IPs and recommend the best one
+detect_score_candidates() {
+    local new_ips="$1" all_ip_counts="$2" local_ip="$3"
+
+    echo ""
+    info "Candidate Luna server IPs:"
+    echo ""
+    printf "  %-18s %8s %10s\n" "IP Address" "RTT" "Packets"
+    printf "  %-18s %8s %10s\n" "──────────────────" "────────" "────────"
+
+    local best_ip="" best_score=0
+
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+
+        local pkt_count
+        pkt_count=$(echo "$all_ip_counts" | grep "$ip" | awk '{print $2}' || echo "0")
+
+        local rtt
+        rtt=$(ping -c 3 -W 5000 "$ip" 2>/dev/null | tail -1 | sed 's/.*= [0-9.]*\/\([0-9.]*\)\/.*/\1/' || echo "timeout")
+
+        printf "  %-18s %7sms %9s\n" "$ip" "$rtt" "$pkt_count"
+
+        # Score: more packets = more likely to be the streaming server
+        if [[ "$pkt_count" =~ ^[0-9]+$ ]] && [[ $pkt_count -gt $best_score ]]; then
+            best_score=$pkt_count
+            best_ip=$ip
+        fi
+    done <<< "$new_ips"
+
+    echo ""
+    if [[ -n "$best_ip" ]]; then
+        local rtt
+        rtt=$(ping -c 5 -W 5000 "$best_ip" 2>/dev/null | tail -1 | sed 's/.*= [0-9.]*\/\([0-9.]*\)\/.*/\1/' || echo "timeout")
+
+        if [[ "$rtt" != "timeout" ]]; then
+            local rtt_int=${rtt%.*}
+            info "Recommended Luna server: $best_ip (avg ${rtt}ms, $best_score packets)"
+            echo ""
+            echo "  Use it with:"
+            echo "    sudo $0 baseline -h $best_ip"
+            echo "    sudo $0 start -t $(( rtt_int + 20 )) -h $best_ip"
+            echo ""
+            echo "  (target = ${rtt_int}ms + 20ms headroom = $(( rtt_int + 20 ))ms)"
+        else
+            info "Likely Luna server: $best_ip ($best_score packets, but doesn't respond to ping)"
+            warn "Server blocks ICMP — you may need to use the AWS endpoint instead:"
+            echo "    sudo $0 start -t 100 -h dynamodb.us-east-1.amazonaws.com"
+        fi
+
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+        echo "$best_ip" > "$STATE_DIR/luna_server" 2>/dev/null || true
+    fi
+}
+
+# ─── Measure RTT from live traffic (for servers that block ping) ──────────────
+
+cmd_measure() {
+    local server_ip="" duration=10
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--host)     server_ip="$2"; shift 2 ;;
+            -d|--duration) duration="$2";  shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    [[ -z "$server_ip" ]] && die "Server IP required: -h <ip>  (use 'detect snap' to find it)"
+    require_root
+
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║       RTT MEASUREMENT FROM LIVE TRAFFIC                    ║"
+    echo "║       Server: $server_ip"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+    info "Capturing ${duration}s of traffic to/from $server_ip..."
+    info "Make sure the game is actively running!"
+    echo ""
+
+    local capture_file="/tmp/ping-stabilizer-rtt-$$.txt"
+
+    # Capture traffic to/from the server with microsecond timestamps
+    tcpdump -i en0 -n -tt host "$server_ip" > "$capture_file" 2>/dev/null &
+    local tcpdump_pid=$!
+    sleep "$duration"
+    kill "$tcpdump_pid" 2>/dev/null || true
+    wait "$tcpdump_pid" 2>/dev/null || true
+
+    if [[ ! -s "$capture_file" ]]; then
+        warn "No traffic captured. Is the game still running?"
+        rm -f "$capture_file"
+        return 1
+    fi
+
+    local total_packets
+    total_packets=$(wc -l < "$capture_file" | tr -d ' ')
+    info "Captured $total_packets packets"
+
+    # ── Packet loss & traffic analysis ──
+    local local_ip
+    local_ip=$(ipconfig getifaddr en0 2>/dev/null || echo "")
+
+    local traffic_stats
+    traffic_stats=$(awk -v local_ip="$local_ip" -v server_ip="$server_ip" '
+    BEGIN { out=0; in_=0; first_ts=0; last_ts=0 }
+    {
+        ts = $1
+        if (first_ts == 0) first_ts = ts
+        last_ts = ts
+        line = $0
+
+        if (index(line, local_ip) < index(line, server_ip) && index(line, ">") > 0) {
+            out++
+            # Extract packet length (last number before "bytes" or end)
+            if (match(line, /length [0-9]+/)) {
+                out_bytes += substr(line, RSTART+7, RLENGTH-7)
+            }
+        } else if (index(line, server_ip) < index(line, local_ip) && index(line, ">") > 0) {
+            in_++
+            if (match(line, /length [0-9]+/)) {
+                in_bytes += substr(line, RSTART+7, RLENGTH-7)
+            }
+        }
+    }
+    END {
+        elapsed = last_ts - first_ts
+        if (elapsed <= 0) elapsed = 1
+
+        printf "%d %d %d %.1f %.0f %.0f\n", out, in_, out+in_, elapsed, out_bytes/1024, in_bytes/1024
+    }' "$capture_file")
+
+    local pkts_out pkts_in pkts_total elapsed_sec kb_out kb_in
+    read -r pkts_out pkts_in pkts_total elapsed_sec kb_out kb_in <<< "$traffic_stats"
+
+    # Detect gaps in traffic (potential dropouts)
+    local gap_analysis
+    gap_analysis=$(awk -v server_ip="$server_ip" -v local_ip="$local_ip" '
+    {
+        ts = $1 + 0
+        line = $0
+        # Only look at incoming packets (server -> us)
+        if (index(line, server_ip) < index(line, local_ip) && index(line, ">") > 0) {
+            if (last_in_ts > 0) {
+                gap = (ts - last_in_ts) * 1000  # ms
+                if (gap > 50) gaps_50++
+                if (gap > 100) gaps_100++
+                if (gap > 200) gaps_200++
+                if (gap > max_gap) max_gap = gap
+                total_gap += gap
+                n++
+            }
+            last_in_ts = ts
+        }
+    }
+    END {
+        avg_gap = (n > 0) ? total_gap / n : 0
+        printf "%d %d %d %.1f %.1f\n", gaps_50+0, gaps_100+0, gaps_200+0, max_gap+0, avg_gap
+    }' "$capture_file")
+
+    local gaps_50 gaps_100 gaps_200 max_gap avg_inter_packet
+    read -r gaps_50 gaps_100 gaps_200 max_gap avg_inter_packet <<< "$gap_analysis"
+
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────┐"
+    echo "  │ TRAFFIC ANALYSIS                                │"
+    echo "  ├─────────────────────────────────────────────────┤"
+    echo "  │ Duration:     ${elapsed_sec}s"
+    echo "  │ Packets out:  $pkts_out  (~${kb_out} KB)"
+    echo "  │ Packets in:   $pkts_in  (~${kb_in} KB)"
+    echo "  │ Total:        $pkts_total packets"
+    echo "  │                                                 │"
+    echo "  │ DROPOUT DETECTION (gaps in incoming stream)     │"
+    echo "  │   Gaps > 50ms:   $gaps_50"
+    echo "  │   Gaps > 100ms:  $gaps_100"
+    echo "  │   Gaps > 200ms:  $gaps_200"
+    echo "  │   Longest gap:   ${max_gap}ms"
+    echo "  │   Avg interval:  ${avg_inter_packet}ms between packets"
+    echo "  └─────────────────────────────────────────────────┘"
+
+    if [[ $gaps_100 -gt 0 ]]; then
+        warn "Detected $gaps_100 gaps >100ms — these cause visible stuttering!"
+    fi
+    if [[ $gaps_200 -gt 0 ]]; then
+        warn "Detected $gaps_200 gaps >200ms — these cause major freezes!"
+    fi
+
+    # Estimate RTT by measuring time between outgoing and next incoming packet.
+    # tcpdump -tt format: "1234567890.123456 IP src > dst: ..."
+    # Outgoing: our IP > server IP
+    # Incoming: server IP > our IP
+    # (local_ip already set above in traffic analysis)
+
+    # Use awk to calculate RTT from packet pairs (outgoing followed by incoming)
+    local rtt_data
+    rtt_data=$(awk -v local_ip="$local_ip" -v server_ip="$server_ip" '
+    {
+        timestamp = $1
+        # Determine direction by looking for "local > server" or "server > local"
+        line = $0
+        if (index(line, local_ip) < index(line, server_ip) && index(line, ">") > 0) {
+            # Outgoing packet
+            if (last_out_ts == 0 || timestamp - last_out_ts > 0.001) {
+                last_out_ts = timestamp
+                waiting_reply = 1
+            }
+        } else if (index(line, server_ip) < index(line, local_ip) && index(line, ">") > 0) {
+            # Incoming packet
+            if (waiting_reply && last_out_ts > 0) {
+                rtt = (timestamp - last_out_ts) * 1000  # convert to ms
+                if (rtt > 0 && rtt < 500) {  # sanity check: ignore >500ms
+                    rtts[n++] = rtt
+                    sum += rtt
+                }
+                waiting_reply = 0
+            }
+        }
+    }
+    END {
+        if (n == 0) { print "NONE"; exit }
+
+        # Sort RTTs
+        for (i = 0; i < n; i++)
+            for (j = i+1; j < n; j++)
+                if (rtts[i] > rtts[j]) { t=rtts[i]; rtts[i]=rtts[j]; rtts[j]=t }
+
+        min = rtts[0]
+        max = rtts[n-1]
+        avg = sum / n
+        if (n % 2 == 1)
+            median = rtts[int(n/2)]
+        else
+            median = (rtts[int(n/2)-1] + rtts[int(n/2)]) / 2
+        jitter = max - min
+
+        # Std dev
+        for (i = 0; i < n; i++) {
+            diff = rtts[i] - avg
+            sq_sum += diff * diff
+        }
+        stddev = sqrt(sq_sum / n)
+
+        printf "%.1f %.1f %.1f %.1f %.1f %.1f %d\n", min, avg, median, max, jitter, stddev, n
+
+        # Also print individual RTTs for distribution view
+        printf "RTTS:"
+        for (i = 0; i < n && i < 50; i++)
+            printf " %.1f", rtts[i]
+        printf "\n"
+    }' "$capture_file")
+
+    rm -f "$capture_file"
+
+    if [[ "$rtt_data" == "NONE" ]]; then
+        warn "Could not estimate RTT from traffic (not enough packet pairs)"
+        return 1
+    fi
+
+    local stats_line
+    stats_line=$(echo "$rtt_data" | head -1)
+    local rtts_line
+    rtts_line=$(echo "$rtt_data" | tail -1 | sed 's/^RTTS: *//')
+
+    local min avg median max jitter stddev sample_count
+    read -r min avg median max jitter stddev sample_count <<< "$stats_line"
+
+    echo ""
+    echo "  ┌─────────────────────────────────────────┐"
+    echo "  │ Server:    $server_ip"
+    echo "  │ Samples:   $sample_count RTT pairs"
+    echo "  │ Duration:  ${duration}s"
+    echo "  │                                         │"
+    echo "  │ Min:       ${min}ms                     "
+    echo "  │ Avg:       ${avg}ms                     "
+    echo "  │ Median:    ${median}ms                  "
+    echo "  │ Max:       ${max}ms                     "
+    echo "  │ Jitter:    ${jitter}ms (max - min)      "
+    echo "  │ Std Dev:   ${stddev}ms                  "
+    echo "  └─────────────────────────────────────────┘"
+
+    if [[ -n "$rtts_line" ]]; then
+        echo ""
+        echo "  Sample RTTs: $rtts_line"
+    fi
+
+    # Recommendation
+    echo ""
+    local max_int=${max%.*}
+    local median_int=${median%.*}
+    local jitter_int=${jitter%.*}
+    local recommended_target=$(( max_int + 10 ))
+
+    if [[ $jitter_int -le 5 ]]; then
+        info "Connection to Luna is very stable. Stabilizer probably not needed."
+    elif [[ $jitter_int -le 15 ]]; then
+        info "Mild jitter (${jitter}ms). Stabilizer may help."
+    else
+        info "Significant jitter (${jitter}ms). Stabilizer recommended."
+    fi
+
+    # Since this server blocks ping, suggest using AWS endpoint for monitoring
+    info "This server blocks ping, so use a nearby pingable host for monitoring."
+    echo ""
+    echo "  Suggested workflow:"
+    echo "    1. sudo $0 baseline -h dynamodb.us-east-1.amazonaws.com"
+    echo "    2. sudo $0 start -t $recommended_target -h dynamodb.us-east-1.amazonaws.com"
+    echo ""
+    echo "  (target ${recommended_target}ms = max RTT ${max}ms + 10ms headroom)"
+}
+
+# ─── Baseline health check ────────────────────────────────────────────────────
+
+cmd_baseline() {
+    local host="$DEFAULT_HOST" count=20
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--host)  host="$2";  shift 2 ;;
+            -c|--count) count="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║           NETWORK BASELINE REPORT                          ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+
+    run_ping_test "$host" "$count" "$host"
+    local stats="$REPLY_STATS"
+    local rtts="$REPLY_RTTS"
+
+    local min avg median max jitter
+    read -r min avg median max jitter <<< "$stats"
+
+    # Calculate standard deviation
+    local stddev
+    stddev=$(echo "$rtts" | awk -v avg="$avg" '
+    {
+        diff = $1 - avg
+        sum_sq += diff * diff
+        n++
+    }
+    END {
+        if (n > 1) printf "%.1f", sqrt(sum_sq / (n - 1))
+        else print "0.0"
+    }')
+
+    # Count how many packets are within various thresholds
+    local within_5 within_10 within_20 total
+    within_5=$(echo "$rtts" | awk -v med="$median" 'function abs(x) { return x < 0 ? -x : x } abs($1 - med) <= 5 { n++ } END { print n+0 }')
+    within_10=$(echo "$rtts" | awk -v med="$median" 'function abs(x) { return x < 0 ? -x : x } abs($1 - med) <= 10 { n++ } END { print n+0 }')
+    within_20=$(echo "$rtts" | awk -v med="$median" 'function abs(x) { return x < 0 ? -x : x } abs($1 - med) <= 20 { n++ } END { print n+0 }')
+    total=$(echo "$rtts" | wc -l | tr -d ' ')
+
+    echo ""
+    echo "  ┌─────────────────────────────────────────┐"
+    echo "  │ Host:      $host"
+    echo "  │ Samples:   $count"
+    echo "  │                                         │"
+    echo "  │ Min:       ${min}ms                     "
+    echo "  │ Avg:       ${avg}ms                     "
+    echo "  │ Median:    ${median}ms                  "
+    echo "  │ Max:       ${max}ms                     "
+    echo "  │ Jitter:    ${jitter}ms (max - min)      "
+    echo "  │ Std Dev:   ${stddev}ms                  "
+    echo "  │                                         │"
+    echo "  │ Stability:                              │"
+    echo "  │   Within ±5ms of median:  $within_5/$total packets"
+    echo "  │   Within ±10ms of median: $within_10/$total packets"
+    echo "  │   Within ±20ms of median: $within_20/$total packets"
+    echo "  └─────────────────────────────────────────┘"
+
+    # Recommendation
+    echo ""
+    local max_int=${max%.*}
+    local median_int=${median%.*}
+    local jitter_int=${jitter%.*}
+    local recommended_target=$(( max_int + 10 ))
+
+    if [[ $jitter_int -le 5 ]]; then
+        info "Connection is very stable (jitter ${jitter}ms). Stabilizer probably not needed."
+    elif [[ $jitter_int -le 15 ]]; then
+        info "Connection has mild jitter (${jitter}ms). Stabilizer may help slightly."
+        info "Suggested: sudo $0 start -t $recommended_target -h $host"
+    elif [[ $jitter_int -le 50 ]]; then
+        info "Connection has moderate jitter (${jitter}ms). Stabilizer recommended."
+        info "Suggested: sudo $0 start -t $recommended_target -h $host"
+    else
+        info "Connection has high jitter (${jitter}ms). Stabilizer strongly recommended."
+        info "Suggested: sudo $0 start -t $recommended_target -h $host"
+        warn "Note: spikes above target (${max}ms) will still pass through."
+    fi
+}
+
 cmd_usage() {
     cat <<'USAGE'
 Ping Stabilizer — Adaptive latency stabilization for cloud gaming
@@ -760,8 +1337,11 @@ Usage: sudo ./ping-stabilizer.sh <command> [options]
 Commands:
   start            Enable ping stabilization
   stop             Disable and remove all interference
+  baseline         Measure jitter to a pingable host
+  measure          Measure RTT from live traffic (for servers that block ping)
   demo             Run before/during/after demonstration
   status           Show current state
+  detect           Detect Luna game server IP (run while playing)
   emergency-reset  Force-remove ALL traces (use if stop fails)
 
 Options:
@@ -775,6 +1355,7 @@ Examples:
   sudo ./ping-stabilizer.sh demo -t 50
   sudo ./ping-stabilizer.sh stop
   sudo ./ping-stabilizer.sh status
+  sudo ./ping-stabilizer.sh detect
   sudo ./ping-stabilizer.sh emergency-reset
 
 Safety:
@@ -800,8 +1381,11 @@ USAGE
 case "${1:-}" in
     start)            shift; cmd_start "$@" ;;
     stop)             shift; cmd_stop "$@" ;;
+    baseline)         shift; cmd_baseline "$@" ;;
+    measure)          shift; cmd_measure "$@" ;;
     status)           cmd_status ;;
     demo)             shift; cmd_demo "$@" ;;
+    detect)           shift; cmd_detect "${1:-watch}" ;;
     emergency-reset)  cmd_emergency_reset ;;
     *)                cmd_usage ;;
 esac

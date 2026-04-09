@@ -1,113 +1,134 @@
 # Ping Stabilizer
 
-Adaptive latency stabilizer for cloud gaming on macOS. Reduces jitter by dynamically adjusting packet delay so your ping stays near a consistent target value.
+Network diagnostic and latency stabilization toolkit for cloud gaming on macOS. Built for Amazon Luna but works with any cloud gaming service.
 
-## The Problem
+## What We Discovered
 
-Cloud gaming services like Amazon Luna are sensitive to **jitter** (variation in latency). A connection with ping values like `3, 4, 9, 33, 7, 88, 9 ms` causes stuttering and input lag spikes, even though the average is low.
+While building this tool we learned that **the #1 cause of cloud gaming stuttering on Mac is not jitter — it's AWDL** (Apple Wireless Direct Link). AWDL is used by AirDrop/AirPlay and periodically hijacks your WiFi radio to scan on a different channel, causing ~100ms packet dropouts.
 
-## The Solution
+### Quick Fix (No Tool Needed)
 
-This tool adds **adaptive delay** to outbound packets using macOS's built-in dummynet (`dnctl` + `pfctl`). Unlike Network Link Conditioner (which adds a **fixed** delay that just shifts all values up), this tool continuously measures your actual network RTT and adjusts the added delay per-measurement:
+```bash
+# Disable AWDL before gaming — stops WiFi channel hopping
+sudo ifconfig awdl0 down
 
-```
-Target: 50ms
-
-Network RTT:  3ms  + 47ms added = ~50ms total
-Network RTT:  9ms  + 41ms added = ~50ms total
-Network RTT: 33ms  + 17ms added = ~50ms total
-Network RTT: 88ms  +  0ms added =  88ms (can't reduce, only add)
+# Re-enable after gaming — restores AirDrop/AirPlay
+sudo ifconfig awdl0 up
 ```
 
-The result: most pings converge near your target, dramatically reducing jitter.
+AWDL re-enables automatically on reboot. This alone may fix your stuttering entirely.
 
-> **Note:** This tool can only **add** delay, never remove it. If a packet naturally takes longer than the target, it passes through unchanged. Set your target above your typical peak latency for best results.
+### When the Stabilizer Helps
+
+If you still experience variable latency after disabling AWDL (common on congested WiFi or long-distance servers), the stabilizer smooths out jitter by adding adaptive delay. It's most effective when:
+- Your ping to the game server varies widely (e.g., 5ms to 80ms)
+- The game server is distant (high base RTT with spikes)
+- You can't use a wired connection
 
 ## Requirements
 
 - macOS (tested on 15.7.3 Sequoia)
-- `sudo` access (dummynet and packet filter require root)
+- `sudo` access (network stack modification requires root)
 - Built-in tools only — no dependencies to install
 
 ## Quick Start
 
 ```bash
-# Make executable (one time)
 chmod +x ping-stabilizer.sh
 
-# Run the full demo (baseline → stabilized → restored)
-sudo ./ping-stabilizer.sh demo -t 50
+# Diagnose your connection first
+./ping-stabilizer.sh baseline
+sudo ./ping-stabilizer.sh detect snap           # find game server IP (while playing)
+sudo ./ping-stabilizer.sh measure -h <server>   # measure real RTT + dropouts
 
-# Or start/stop manually
+# If stabilizer is needed
 sudo ./ping-stabilizer.sh start -t 50
 sudo ./ping-stabilizer.sh stop
 ```
 
 ## Commands
 
-### `start` — Enable stabilization
+### `baseline` — Measure jitter to a pingable host
 
-Measures baseline ping, configures adaptive delay, and launches a background monitor that continuously adjusts the delay.
+No sudo required. Runs 20 pings and reports min/avg/median/max, jitter, standard deviation, stability score, and a recommendation.
 
 ```bash
-sudo ./ping-stabilizer.sh start -t <target_ms> [-h <host>] [-c <count>]
+./ping-stabilizer.sh baseline
+./ping-stabilizer.sh baseline -h dynamodb.us-east-1.amazonaws.com
+./ping-stabilizer.sh baseline -h 8.8.8.8 -c 50
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-t, --target <ms>` | Target ping in milliseconds (required) | — |
-| `-h, --host <addr>` | Host to measure baseline against | `8.8.8.8` |
-| `-c, --count <n>` | Number of pings for baseline measurement | `10` |
+| `-h, --host <addr>` | Host to ping | `8.8.8.8` |
+| `-c, --count <n>` | Number of pings | `20` |
 
-**Examples:**
+### `detect` — Find game server IP
+
+Uses `tcpdump` to capture live network traffic and identify the game streaming server by packet volume.
+
 ```bash
-# Stabilize at 50ms, measure against Google DNS
-sudo ./ping-stabilizer.sh start -t 50
+# Quick snapshot while game is running
+sudo ./ping-stabilizer.sh detect snap
 
-# Stabilize at 100ms, measure against Cloudflare
-sudo ./ping-stabilizer.sh start -t 100 -h 1.1.1.1
-
-# Use 20 pings for more accurate baseline
-sudo ./ping-stabilizer.sh start -t 50 -c 20
+# Interactive: captures before and after game launch
+sudo ./ping-stabilizer.sh detect
 ```
 
+**Snap mode** captures 5 seconds of UDP traffic and ranks external IPs by packet count. The top talker (thousands of packets) is your game streaming server.
+
+**Watch mode** takes a baseline before you start the game, then captures again after — showing only new connections.
+
+### `measure` — Measure RTT and dropouts from live traffic
+
+For servers that block ping (like Luna's). Uses `tcpdump` timestamps to estimate RTT from actual game packets, and detects gaps in the incoming stream that cause stuttering.
+
+```bash
+sudo ./ping-stabilizer.sh measure -h 63.178.107.163
+sudo ./ping-stabilizer.sh measure -h 63.178.107.163 -d 30    # 30 second capture
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-h, --host <ip>` | Server IP (required, use `detect` to find) | — |
+| `-d, --duration <sec>` | Capture duration | `10` |
+
+Output includes:
+- **Traffic analysis**: packets in/out, data volume, duration
+- **Dropout detection**: gaps >50ms, >100ms, >200ms in the incoming stream, longest gap
+- **RTT estimation**: min/avg/median/max/jitter/stddev from packet pair timing
+
+### `start` — Enable ping stabilization
+
+Measures baseline, configures adaptive delay via dummynet, and launches a background monitor.
+
+```bash
+sudo ./ping-stabilizer.sh start -t 50
+sudo ./ping-stabilizer.sh start -t 100 -h dynamodb.us-east-1.amazonaws.com
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-t, --target <ms>` | Target ping in ms (required) | — |
+| `-h, --host <addr>` | Host for baseline and adaptive monitoring | `8.8.8.8` |
+| `-c, --count <n>` | Pings for baseline measurement | `10` |
+
 **What it does:**
-1. Takes a snapshot of your current system state (pf rules, dummynet pipes)
-2. Runs baseline ping measurements
-3. Creates a dummynet pipe with calculated initial delay
-4. Injects a pfctl anchor (isolated from your existing firewall rules)
-5. Launches a background monitor that pings every 500ms and adjusts the delay
-6. Shows a before/after comparison table
+1. Saves a full system snapshot (pf rules, dummynet pipes)
+2. Measures baseline ping to `-h` host
+3. Calculates initial delay = target - median baseline
+4. Creates a dummynet pipe and pfctl anchor
+5. Launches a background monitor that adjusts delay every 200ms using EWMA smoothing
+
+**Important:** The `-h` host is what the monitor pings to adapt the delay. All traffic gets the same delay, but it's optimized for the `-h` host's latency. Choose the host that matters most (game server proxy or nearby AWS endpoint).
 
 ### `stop` — Disable stabilization
-
-Cleanly reverses all changes and restores the system to its pre-start state.
 
 ```bash
 sudo ./ping-stabilizer.sh stop
 ```
 
-**What it does:**
-1. Kills the background monitor process
-2. Flushes the pfctl anchor rules
-3. Restores the original main pf ruleset from backup
-4. Releases the pf enable token
-5. Deletes the dummynet pipe
-6. Runs a verification ping to confirm cleanup
-
-### `demo` — Before/during/after demonstration
-
-Runs a full automated comparison testing against both Google DNS and AWS servers.
-
-```bash
-sudo ./ping-stabilizer.sh demo -t <target_ms> [-c <count>]
-```
-
-**What it does:**
-1. **Phase 1 — Baseline:** Pings Google DNS and AWS with no stabilization
-2. **Phase 2 — Stabilized:** Enables stabilization, pings both targets
-3. **Phase 3 — Restored:** Disables stabilization, pings both to confirm cleanup
-4. Prints a comparison table with min/avg/median/max/jitter for all phases
+Kills the monitor, removes pfctl anchor, restores original pf rules from backup, releases the pf token, deletes the dummynet pipe, and verifies cleanup.
 
 ### `status` — Show current state
 
@@ -115,134 +136,142 @@ sudo ./ping-stabilizer.sh demo -t <target_ms> [-c <count>]
 sudo ./ping-stabilizer.sh status
 ```
 
-Shows whether the stabilizer is active, current target, monitor PID, last measured RTT, current applied delay, and active pfctl rules.
+Shows whether the stabilizer is active, target, monitor PID, measured RTT, smoothed RTT (EWMA), current delay, and active pfctl rules.
+
+### `demo` — Before/during/after demonstration
+
+```bash
+sudo ./ping-stabilizer.sh demo -t 50
+sudo ./ping-stabilizer.sh demo -t 100 -h dynamodb.us-east-1.amazonaws.com
+```
+
+Runs a full automated comparison: baseline pings, enables stabilization, pings again, disables, pings again. Tests against both Google DNS and AWS. Shows a comparison table with jitter reduction.
 
 ### `emergency-reset` — Force cleanup
-
-Nuclear option for when `stop` fails (e.g., state files were deleted, system rebooted mid-session).
 
 ```bash
 sudo ./ping-stabilizer.sh emergency-reset
 ```
 
-**What it does:**
-1. Kills the monitor process (and hunts for orphaned processes by name)
+Nuclear option for when `stop` fails. Works even if state files are missing:
+1. Kills monitor processes (and hunts orphans by name)
 2. Flushes the pfctl anchor
-3. Restores pf rules from snapshot, state backup, or `/etc/pf.conf` (in that order)
-4. Releases any held pf tokens
-5. Deletes the dummynet pipe
-6. Removes state files
-7. Runs verification to confirm the system is clean
+3. Restores pf rules from snapshot, backup, or `/etc/pf.conf`
+4. Deletes dummynet pipe
+5. Verifies system is clean
+
+## How the Stabilizer Works
+
+### The Problem with Fixed Delay
+
+Network Link Conditioner and similar tools add a **fixed delay** to all packets. This just shifts everything up — jitter stays the same:
+
+```
+Fixed +40ms:   3ms→43ms   9ms→49ms   33ms→73ms   88ms→128ms
+Jitter: 85ms before, 85ms after (unchanged!)
+```
+
+### Adaptive Delay
+
+This tool adds a **variable delay** based on current network conditions:
+
+```
+Target 50ms:   3ms+47ms=50ms   9ms+41ms=50ms   33ms+17ms=50ms   88ms+0ms=88ms
+Most packets converge near 50ms. Spikes above target pass through unchanged.
+```
+
+### The Adaptive Monitor
+
+A background process runs every 200ms:
+1. Pings the target host
+2. Subtracts the current added delay to get the true network RTT
+3. Applies EWMA smoothing (30% new sample, 70% history) to avoid overreacting to outliers
+4. Rejects outlier measurements (>2x the smoothed average)
+5. Updates the dummynet pipe only if the delay changes by >2ms
+
+### Architecture
+
+```
+ping-stabilizer.sh
+  |
+  |-- start ──> Background Monitor (every 200ms)
+  |                  |
+  |                  ├── ping target host
+  |                  ├── true_rtt = measured - current_delay
+  |                  ├── smoothed = EWMA(true_rtt)
+  |                  └── dnctl pipe 1 config delay Xms
+  |                           |
+  |                           v
+  |              pfctl anchor: dummynet out → pipe 1
+  |              (all outbound tcp/udp/icmp)
+  |
+  |-- stop ───> kill monitor, flush anchor, restore pf rules, delete pipe
+  |
+  |-- detect ─> tcpdump capture → rank IPs by packet count
+  |
+  |-- measure → tcpdump capture → RTT estimation + dropout detection
+```
 
 ## Safety
 
-This tool modifies live network configuration. Multiple safety layers ensure you can always recover:
+### Recovery layers
 
-| Recovery level | Command | When to use |
-|----------------|---------|-------------|
+| Level | Command | When to use |
+|-------|---------|-------------|
 | Normal | `sudo ./ping-stabilizer.sh stop` | Standard shutdown |
-| State files lost | `sudo ./ping-stabilizer.sh emergency-reset` | Stop won't work, reboot happened |
+| State files lost | `sudo ./ping-stabilizer.sh emergency-reset` | After reboot, corrupted state |
 | Everything broken | `sudo pfctl -f /etc/pf.conf && sudo dnctl pipe 1 delete` | Absolute last resort |
-
-### Safety features
-
-- **Pre-change snapshots** saved to `.backups/` in the project directory (survives reboots)
-- **pfctl anchor isolation** — your existing firewall rules are never modified directly
-- **Reference-counted pf enable** (`pfctl -E` / `-X`) — won't accidentally disable your firewall
-- **Rollback on setup failure** — if any step fails during `start`, previous steps are undone
-- **Ctrl+C trap during demo** — interrupted demo auto-cleans all changes
-- **Dual backup locations** — pf rules backed up to both `/tmp` (fast) and `.backups/` (persistent)
 
 ### What gets modified (and reversed)
 
 | Component | Modified by `start` | Reversed by `stop` |
 |-----------|--------------------|--------------------|
 | Dummynet pipe 1 | Created with delay | Deleted |
-| PF main ruleset | Anchor reference added | Original rules restored from backup |
+| PF main ruleset | Anchor reference injected | Original rules restored from backup |
 | PF anchor `com.ping-stabilizer` | Dummynet out rule loaded | Flushed |
 | PF enable state | Enabled via `-E` (ref counted) | Token released via `-X` |
 | Background process | Monitor launched | Process killed |
 | `/tmp/ping-stabilizer/` | State files created | Directory removed |
 
-## How It Works
+### Safety features
 
-### Architecture
+- **Pre-change snapshots** saved to `.backups/` (survives reboots)
+- **pfctl anchor isolation** — existing firewall rules never modified directly
+- **Reference-counted pf** (`-E`/`-X`) — won't accidentally disable your firewall
+- **Rollback on setup failure** — if any step fails during `start`, previous steps are undone
+- **Ctrl+C trap during demo** — interrupted demo auto-cleans
+- **Dual backup locations** — pf rules in both `/tmp` and `.backups/`
+- **Empty-rules guard** — won't flush all pf rules if restore produces empty output
 
-```
-┌─────────────────────────────────────────────┐
-│  ping-stabilizer.sh                         │
-│                                             │
-│  ┌──────────┐    ┌───────────────────────┐  │
-│  │  start   │───>│  Background Monitor   │  │
-│  │  stop    │    │                       │  │
-│  │  demo    │    │  Every 500ms:         │  │
-│  │  status  │    │  1. Ping target host  │  │
-│  │  reset   │    │  2. Measure RTT       │  │
-│  └──────────┘    │  3. Calc new delay    │  │
-│                  │  4. Update dummynet   │  │
-│                  └───────────────────────┘  │
-│                           │                 │
-│                           v                 │
-│              ┌────────────────────────┐     │
-│              │  dnctl pipe 1 config   │     │
-│              │  delay ${new_delay}ms  │     │
-│              └────────────────────────┘     │
-│                           │                 │
-│                           v                 │
-│              ┌────────────────────────┐     │
-│              │  pfctl anchor          │     │
-│              │  dummynet out → pipe 1 │     │
-│              └────────────────────────┘     │
-└─────────────────────────────────────────────┘
-```
-
-### Adaptive delay algorithm
-
-The background monitor runs this loop every 500ms:
-
-1. Ping the target host once
-2. Read the RTT from the reply
-3. Calculate `new_delay = target - rtt` (minimum 0)
-4. If the change exceeds 2ms (to avoid flapping), update the dummynet pipe
-5. Write current stats to a file for the `status` command
-
-### Why not a fixed delay?
-
-A fixed delay (like Network Link Conditioner) adds the **same** delay to every packet:
-
-```
-Fixed +40ms delay:
-  3ms  + 40ms = 43ms
-  9ms  + 40ms = 49ms
-  33ms + 40ms = 73ms
-  88ms + 40ms = 128ms
-  Jitter: 85ms (same as before!)
-```
-
-Adaptive delay adds a **different** delay based on current conditions:
-
-```
-Adaptive (target 50ms):
-  3ms  + 47ms = ~50ms
-  9ms  + 41ms = ~50ms
-  33ms + 17ms = ~50ms
-  88ms +  0ms =  88ms
-  Jitter: reduced significantly for most packets
-```
-
-## Choosing a Target
-
-| Target | Best for | Trade-off |
-|--------|----------|-----------|
-| 20-30ms | Low-latency connections (< 15ms baseline) | Small buffer, spikes still visible |
-| 40-60ms | Typical home connections | Good balance for casual cloud gaming |
-| 80-100ms | Connections with frequent spikes | Maximum stability, higher base latency |
-
-**Rule of thumb:** Set the target ~10-20ms above your typical maximum ping (excluding rare outliers). Check your baseline with:
+## Recommended Workflow for Luna
 
 ```bash
-ping -c 20 8.8.8.8
+# 1. Disable AWDL (biggest impact)
+sudo ifconfig awdl0 down
+
+# 2. Start a game, then detect the server
+sudo ./ping-stabilizer.sh detect snap
+
+# 3. Measure real connection quality
+sudo ./ping-stabilizer.sh measure -h <detected-ip> -d 30
+
+# 4. If dropouts are gone but jitter remains, stabilize
+sudo ./ping-stabilizer.sh baseline -h dynamodb.us-east-1.amazonaws.com
+sudo ./ping-stabilizer.sh start -t <suggested-target> -h dynamodb.us-east-1.amazonaws.com
+
+# 5. When done gaming
+sudo ./ping-stabilizer.sh stop
+sudo ifconfig awdl0 up
 ```
+
+## Limitations
+
+- Can only **add** latency, never reduce it — packets above target pass through unchanged
+- Delay is global (one value for all traffic) — optimized for the `-h` host
+- The monitor samples every 200ms — sub-200ms network fluctuations aren't individually compensated
+- Game servers often block ICMP (ping), so use `detect` + `measure` instead of `baseline`
+- macOS only (uses `dnctl` and `pfctl`)
+- Requires `sudo` for most commands
 
 ## File Structure
 
@@ -251,7 +280,8 @@ ping-stabilizer/
 ├── ping-stabilizer.sh     # Main script (the only file you run)
 ├── README.md              # This file
 └── .backups/              # Created at runtime — system state snapshots
-    ├── latest -> snapshot_YYYYMMDD_HHMMSS
+    ├── latest -> snapshot_YYYYMMDD_HHMMSS/
+    ├── pf_rules_pre_inject.txt
     └── snapshot_YYYYMMDD_HHMMSS/
         ├── pf_rules.txt
         ├── pf_nat.txt
@@ -261,11 +291,3 @@ ping-stabilizer/
         ├── etc_pf.conf
         └── pf_was_enabled.txt
 ```
-
-## Limitations
-
-- Can only **add** latency, never reduce it — packets above target pass through unchanged
-- The adaptive monitor measures RTT every 500ms — very short bursts between measurements aren't compensated
-- Applies to **all** outbound traffic (tcp/udp/icmp), not just gaming traffic
-- macOS only (uses `dnctl` and `pfctl` which are macOS-specific)
-- Requires `sudo` for every command (network stack modification needs root)
