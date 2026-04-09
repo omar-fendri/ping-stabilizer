@@ -48,6 +48,16 @@ sudo ./ping-stabilizer.sh stop
 
 ## Commands
 
+Every command has detailed built-in help:
+
+```bash
+./ping-stabilizer.sh help              # full overview
+./ping-stabilizer.sh help <command>    # detailed help for a specific command
+./ping-stabilizer.sh help start
+./ping-stabilizer.sh help measure
+./ping-stabilizer.sh help detect
+```
+
 ### `baseline` — Measure jitter to a pingable host
 
 No sudo required. Runs 20 pings and reports min/avg/median/max, jitter, standard deviation, stability score, and a recommendation.

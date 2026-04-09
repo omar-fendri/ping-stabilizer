@@ -1330,55 +1330,234 @@ cmd_baseline() {
 
 cmd_usage() {
     cat <<'USAGE'
-Ping Stabilizer — Adaptive latency stabilization for cloud gaming
+Ping Stabilizer — Network diagnostics & latency stabilization for cloud gaming
 
 Usage: sudo ./ping-stabilizer.sh <command> [options]
 
 Commands:
+  help             Show detailed help for a command
   start            Enable ping stabilization
   stop             Disable and remove all interference
   baseline         Measure jitter to a pingable host
-  measure          Measure RTT from live traffic (for servers that block ping)
+  measure          Measure RTT + dropouts from live traffic (servers that block ping)
   demo             Run before/during/after demonstration
   status           Show current state
-  detect           Detect Luna game server IP (run while playing)
+  detect           Detect game server IP (run while playing)
   emergency-reset  Force-remove ALL traces (use if stop fails)
 
+Run './ping-stabilizer.sh help <command>' for detailed usage of any command.
+USAGE
+}
+
+cmd_help() {
+    local topic="${1:-overview}"
+
+    case "$topic" in
+    start)
+        cat <<'HELP'
+start — Enable ping stabilization
+
+Usage: sudo ./ping-stabilizer.sh start -t <ms> [-h <host>] [-c <count>]
+
 Options:
-  -t, --target <ms>    Target ping in ms (required for start/demo)
-  -h, --host <addr>    Ping target host (default: 8.8.8.8)
-  -c, --count <n>      Number of pings for measurement (default: 10)
+  -t, --target <ms>    Target ping in ms (required)
+  -h, --host <addr>    Host for baseline + adaptive monitoring (default: 8.8.8.8)
+  -c, --count <n>      Pings for baseline measurement (default: 10)
 
 Examples:
   sudo ./ping-stabilizer.sh start -t 50
-  sudo ./ping-stabilizer.sh start -t 100 -h 1.1.1.1
+  sudo ./ping-stabilizer.sh start -t 100 -h dynamodb.us-east-1.amazonaws.com
+
+The -h host is what the background monitor pings to adapt the delay.
+All traffic gets the same delay, but it's optimized for the -h host.
+Choose the host that matters most for your gaming experience.
+
+A full system snapshot is saved before any changes are made.
+HELP
+        ;;
+    stop)
+        cat <<'HELP'
+stop — Disable ping stabilization and remove all interference
+
+Usage: sudo ./ping-stabilizer.sh stop
+
+Kills the background monitor, removes the pfctl anchor, restores original
+pf rules from backup, releases the pf token, and deletes the dummynet pipe.
+
+If stop fails (e.g. state files missing), use 'emergency-reset' instead.
+HELP
+        ;;
+    baseline)
+        cat <<'HELP'
+baseline — Measure current jitter to a pingable host
+
+Usage: ./ping-stabilizer.sh baseline [-h <host>] [-c <count>]
+
+Options:
+  -h, --host <addr>    Host to ping (default: 8.8.8.8)
+  -c, --count <n>      Number of pings (default: 20)
+
+Examples:
+  ./ping-stabilizer.sh baseline
+  ./ping-stabilizer.sh baseline -h dynamodb.us-east-1.amazonaws.com
+  ./ping-stabilizer.sh baseline -h 1.1.1.1 -c 50
+
+Reports min/avg/median/max, jitter, standard deviation, stability score
+(packets within +/-5, 10, 20ms of median), and a recommendation with
+a suggested start command.
+
+Does not require sudo.
+HELP
+        ;;
+    measure)
+        cat <<'HELP'
+measure — Measure RTT and dropouts from live game traffic
+
+Usage: sudo ./ping-stabilizer.sh measure -h <ip> [-d <seconds>]
+
+Options:
+  -h, --host <ip>      Server IP (required — use 'detect' to find it)
+  -d, --duration <sec>  Capture duration (default: 10)
+
+Examples:
+  sudo ./ping-stabilizer.sh measure -h 63.178.107.163
+  sudo ./ping-stabilizer.sh measure -h 63.178.107.163 -d 30
+
+Uses tcpdump to capture live traffic and analyze:
+  - Traffic volume (packets in/out, data size)
+  - Dropout detection (gaps >50ms, >100ms, >200ms in incoming stream)
+  - RTT estimation from outgoing/incoming packet pair timing
+
+Essential for game servers that block ping (like Amazon Luna).
+Run this while actively playing a game.
+HELP
+        ;;
+    demo)
+        cat <<'HELP'
+demo — Run a before/during/after demonstration
+
+Usage: sudo ./ping-stabilizer.sh demo -t <ms> [-h <host>] [-c <count>]
+
+Options:
+  -t, --target <ms>    Target ping in ms (required)
+  -h, --host <addr>    Host for monitoring — delay is optimized for this host (default: 8.8.8.8)
+  -c, --count <n>      Pings per phase (default: 10)
+
+Examples:
   sudo ./ping-stabilizer.sh demo -t 50
-  sudo ./ping-stabilizer.sh stop
-  sudo ./ping-stabilizer.sh status
-  sudo ./ping-stabilizer.sh detect
-  sudo ./ping-stabilizer.sh emergency-reset
+  sudo ./ping-stabilizer.sh demo -t 100 -h dynamodb.us-east-1.amazonaws.com
+
+Runs three phases:
+  1. Baseline — pings Google DNS + AWS with no stabilization
+  2. Stabilized — enables stabilization, pings both targets
+  3. Restored — disables stabilization, pings both to confirm cleanup
+
+Shows a comparison table with jitter reduction for each phase.
+HELP
+        ;;
+    status)
+        cat <<'HELP'
+status — Show current stabilizer state
+
+Usage: sudo ./ping-stabilizer.sh status
+
+Shows whether the stabilizer is active, current target, monitor PID,
+measured RTT (raw), smoothed RTT (EWMA), current applied delay,
+and active pfctl rules.
+HELP
+        ;;
+    detect)
+        cat <<'HELP'
+detect — Detect game server IP from live traffic
+
+Usage: sudo ./ping-stabilizer.sh detect [snap]
+
+Modes:
+  detect        Interactive — snapshots connections before/after game launch
+  detect snap   Quick — captures 5 seconds of current UDP traffic
+
+Examples:
+  sudo ./ping-stabilizer.sh detect snap   # while game is running
+  sudo ./ping-stabilizer.sh detect        # guided before/after
+
+Uses tcpdump to capture UDP traffic and ranks external IPs by packet count.
+The top talker (thousands of packets/sec) is your game streaming server.
+
+Excludes local/private IPs and DNS traffic automatically.
+HELP
+        ;;
+    emergency-reset)
+        cat <<'HELP'
+emergency-reset — Force-remove all traces of ping-stabilizer
+
+Usage: sudo ./ping-stabilizer.sh emergency-reset
+
+Use when 'stop' fails (state files missing, system rebooted mid-session).
+
+Actions:
+  1. Kills monitor process + hunts orphaned processes by name
+  2. Flushes the pfctl anchor
+  3. Restores pf rules from snapshot, backup, or /etc/pf.conf
+  4. Releases any held pf tokens
+  5. Deletes dummynet pipe
+  6. Removes state files
+  7. Verifies system is clean
+
+As an absolute last resort, you can always run manually:
+  sudo pfctl -f /etc/pf.conf && sudo dnctl pipe 1 delete
+HELP
+        ;;
+    overview|*)
+        cat <<'HELP'
+Ping Stabilizer — Network diagnostics & latency stabilization for cloud gaming
+
+Quick Fix for Luna Stuttering:
+  sudo ifconfig awdl0 down     # disable AirDrop WiFi scanning (biggest impact)
+  sudo ifconfig awdl0 up       # re-enable after gaming
+
+Diagnostic Workflow:
+  ./ping-stabilizer.sh baseline                          # measure jitter
+  sudo ./ping-stabilizer.sh detect snap                  # find game server IP
+  sudo ./ping-stabilizer.sh measure -h <ip> -d 30        # check RTT + dropouts
+
+Stabilizer Workflow:
+  sudo ./ping-stabilizer.sh start -t <target> -h <host>  # enable
+  sudo ./ping-stabilizer.sh status                        # check state
+  sudo ./ping-stabilizer.sh stop                          # disable
+
+Options (for start/demo):
+  -t, --target <ms>    Target ping in ms (required)
+  -h, --host <addr>    Ping target host (default: 8.8.8.8)
+  -c, --count <n>      Number of pings for measurement (default: 10)
+
+Options (for measure):
+  -h, --host <ip>      Server IP (required)
+  -d, --duration <sec>  Capture duration (default: 10)
 
 Safety:
-  - A full system snapshot is saved before any changes
-  - Snapshots are stored in .backups/ (survives reboots)
-  - 'stop' cleanly reverses all changes
-  - 'emergency-reset' force-cleans even if state files are lost
-  - As last resort: sudo pfctl -f /etc/pf.conf && sudo dnctl pipe 1 delete
+  - Snapshots saved to .backups/ before any changes
+  - 'stop' cleanly reverses everything
+  - 'emergency-reset' works even with missing state files
+  - Last resort: sudo pfctl -f /etc/pf.conf && sudo dnctl pipe 1 delete
 
 How it works:
-  Unlike a fixed delay (which just shifts all ping values up), this tool
-  uses ADAPTIVE delay: it continuously measures your actual network RTT
-  and adjusts the added delay so that total RTT stays near the target.
+  Unlike fixed delay (Network Link Conditioner), this uses ADAPTIVE delay:
+  adds MORE delay when network is fast, LESS when slow, so total RTT
+  stays near the target. Background monitor adjusts every 200ms with
+  EWMA smoothing to avoid overreacting to outliers.
 
-  Fast packet (3ms)  + 47ms added delay = ~50ms total
-  Slow packet (33ms) + 17ms added delay = ~50ms total
-  Spike (88ms)       +  0ms added delay =  88ms total (can't reduce)
-USAGE
+  Can only ADD delay, never reduce it. Packets above target pass through.
+
+Run './ping-stabilizer.sh help <command>' for detailed help on any command.
+HELP
+        ;;
+    esac
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 case "${1:-}" in
+    help)             shift; cmd_help "${1:-overview}" ;;
     start)            shift; cmd_start "$@" ;;
     stop)             shift; cmd_stop "$@" ;;
     baseline)         shift; cmd_baseline "$@" ;;
